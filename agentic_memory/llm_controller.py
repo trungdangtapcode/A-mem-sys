@@ -211,13 +211,53 @@ class OpenRouterController(BaseLLMController):
             empty_response = self._generate_empty_response(response_format)
             return json.dumps(empty_response)
 
+class GeminiController(BaseLLMController):
+    """LLM controller for Google Gemini API using litellm.
+
+    Args:
+        model: Gemini model identifier (e.g., "gemini-2.0-flash", "gemini-1.5-pro").
+               The "gemini/" prefix is automatically added if not present.
+        api_key: Google API key. If None, reads from GOOGLE_API_KEY env variable.
+    """
+
+    def __init__(self, model: str = "gemini-2.0-flash", api_key: Optional[str] = None):
+        if not model.startswith("gemini/"):
+            self.model = f"gemini/{model}"
+        else:
+            self.model = model
+
+        if api_key is None:
+            api_key = os.getenv('GOOGLE_API_KEY')
+        if api_key is None:
+            raise ValueError("Google API key not found. Set GOOGLE_API_KEY environment variable.")
+
+        os.environ['GEMINI_API_KEY'] = api_key
+        self.api_key = api_key
+
+    def get_completion(self, prompt: str, response_format: dict, temperature: float = 1.0) -> str:
+        try:
+            response = completion(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": "You must respond with a JSON object."},
+                    {"role": "user", "content": prompt}
+                ],
+                response_format=response_format,
+                temperature=temperature
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            empty_response = self._generate_empty_response(response_format)
+            return json.dumps(empty_response)
+
+
 class LLMController:
     """LLM-based controller for memory metadata generation.
 
-    Supports multiple backends: OpenAI, Ollama, SGLang, and OpenRouter.
+    Supports multiple backends: OpenAI, Ollama, SGLang, OpenRouter, and Gemini.
     """
     def __init__(self,
-                 backend: Literal["openai", "ollama", "sglang", "openrouter"] = "openai",
+                 backend: Literal["openai", "ollama", "sglang", "openrouter", "gemini"] = "openai",
                  model: str = "gpt-4",
                  api_key: Optional[str] = None,
                  sglang_host: str = "http://localhost",
@@ -230,8 +270,10 @@ class LLMController:
             self.llm = SGLangController(model, sglang_host, sglang_port)
         elif backend == "openrouter":
             self.llm = OpenRouterController(model, api_key)
+        elif backend == "gemini":
+            self.llm = GeminiController(model, api_key)
         else:
-            raise ValueError("Backend must be one of: 'openai', 'ollama', 'sglang', 'openrouter'")
+            raise ValueError("Backend must be one of: 'openai', 'ollama', 'sglang', 'openrouter', 'gemini'")
 
     def get_completion(self, prompt: str, response_format: dict = None, temperature: float = 1.0) -> str:
         return self.llm.get_completion(prompt, response_format, temperature)

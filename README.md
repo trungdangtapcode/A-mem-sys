@@ -2,6 +2,22 @@
 
 A novel agentic memory system for LLM agents that can dynamically organize memories in an agentic way.
 
+## Code Reading Guide
+
+If you want to understand the codebase quickly instead of only the high-level project pitch, start here:
+
+- [`README_CODEBASE.md`](README_CODEBASE.md) - practical codebase walkthrough
+- [`agentic_memory/README.md`](agentic_memory/README.md) - core package and main classes
+- [`tests/README.md`](tests/README.md) - what the test suite is trying to protect
+
+## Tài liệu tiếng Việt
+
+Nếu bạn muốn đọc repo theo logic của hệ thống A-MEM thay vì theo góc nhìn kỹ thuật thuần túy:
+
+- [`README_CODEBASE.md`](README_CODEBASE.md) - giải thích ý tưởng chính của repo và cách nó hiện thực logic của A-MEM
+- [`agentic_memory/README.md`](agentic_memory/README.md) - giải thích package lõi theo ngôn ngữ dễ đọc hơn
+- [`tests/README.md`](tests/README.md) - giải thích test đang bảo vệ những hành vi nào
+
 ## Introduction 🌟
 
 Large Language Model (LLM) agents have demonstrated remarkable capabilities in handling complex real-world tasks through external tool usage. However, to effectively leverage historical experiences, they require sophisticated memory systems. Traditional memory systems, while providing basic storage and retrieval functionality, often lack advanced memory organization capabilities.
