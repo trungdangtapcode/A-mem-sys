@@ -36,6 +36,7 @@ class MemoryNote:
     def __init__(self,
                  content: str,
                  id: Optional[str] = None,
+                 name: Optional[str] = None,
                  keywords: Optional[List[str]] = None,
                  links: Optional[Dict] = None,
                  retrieval_count: Optional[int] = None,
@@ -51,6 +52,7 @@ class MemoryNote:
         Args:
             content (str): The main text content of the memory
             id (Optional[str]): Unique identifier for the memory. If None, a UUID will be generated
+            name (Optional[str]): Human-readable name for the memory (used as filename)
             keywords (Optional[List[str]]): Key terms extracted from the content
             links (Optional[Dict]): References to related memories
             retrieval_count (Optional[int]): Number of times this memory has been accessed
@@ -65,6 +67,7 @@ class MemoryNote:
         # Core content and ID
         self.content = content
         self.id = id or str(uuid.uuid4())
+        self.name = name
         
         # Semantic metadata
         self.keywords = keywords or []
@@ -85,6 +88,78 @@ class MemoryNote:
         # Summary for long content embedding
         self.summary = summary
 
+    @property
+    def filename(self) -> str:
+        """Generate a filesystem-safe filename from the name, falling back to id."""
+        if not self.name:
+            return self.id
+        # Lowercase, replace spaces/special chars with hyphens
+        import re
+        slug = self.name.lower().strip()
+        slug = re.sub(r'[^\w\s-]', '', slug)
+        slug = re.sub(r'[\s_]+', '-', slug)
+        slug = slug.strip('-')
+        return slug or self.id
+
+    def to_markdown(self) -> str:
+        """Serialize this note to a markdown string with YAML frontmatter."""
+        frontmatter = {
+            "id": self.id,
+            "name": self.name,
+            "keywords": self.keywords,
+            "links": self.links,
+            "retrieval_count": self.retrieval_count,
+            "timestamp": self.timestamp,
+            "last_accessed": self.last_accessed,
+            "context": self.context,
+            "evolution_history": self.evolution_history,
+            "category": self.category,
+            "tags": self.tags,
+        }
+        if self.summary:
+            frontmatter["summary"] = self.summary
+
+        lines = ["---"]
+        for key, value in frontmatter.items():
+            lines.append(f"{key}: {json.dumps(value, ensure_ascii=False)}")
+        lines.append("---")
+        lines.append("")
+        lines.append(self.content)
+        return "\n".join(lines)
+
+    @classmethod
+    def from_markdown(cls, text: str) -> "MemoryNote":
+        """Deserialize a MemoryNote from a markdown string with YAML frontmatter."""
+        parts = text.split("---", 2)
+        if len(parts) < 3:
+            raise ValueError("Invalid markdown format: missing frontmatter")
+
+        frontmatter_str = parts[1].strip()
+        content = parts[2].strip()
+
+        metadata = {}
+        for line in frontmatter_str.split("\n"):
+            if ": " in line:
+                key, value = line.split(": ", 1)
+                metadata[key.strip()] = json.loads(value)
+
+        return cls(
+            content=content,
+            id=metadata.get("id"),
+            name=metadata.get("name"),
+            keywords=metadata.get("keywords"),
+            links=metadata.get("links"),
+            retrieval_count=metadata.get("retrieval_count"),
+            timestamp=metadata.get("timestamp"),
+            last_accessed=metadata.get("last_accessed"),
+            context=metadata.get("context"),
+            evolution_history=metadata.get("evolution_history"),
+            category=metadata.get("category"),
+            tags=metadata.get("tags"),
+            summary=metadata.get("summary"),
+        )
+
+
 class AgenticMemorySystem:
     """Core memory system that manages memory notes and their evolution.
     
@@ -102,35 +177,89 @@ class AgenticMemorySystem:
                  evo_threshold: int = 100,
                  api_key: Optional[str] = None,
                  sglang_host: str = "http://localhost",
-                 sglang_port: int = 30000):
+                 sglang_port: int = 30000,
+                 persist_dir: Optional[str] = None):
         """Initialize the memory system.
 
         Args:
             model_name: Name of the sentence transformer model
-            llm_backend: LLM backend to use (openai/ollama/sglang)
+            llm_backend: LLM backend to use (openai/ollama/sglang/gemini)
             llm_model: Name of the LLM model
             evo_threshold: Number of memories before triggering evolution
             api_key: API key for the LLM service
             sglang_host: Host URL for SGLang server (default: http://localhost)
             sglang_port: Port for SGLang server (default: 30000)
+            persist_dir: Directory for persistent storage. If None, uses in-memory mode.
         """
         self.memories = {}
         self.model_name = model_name
-        # Initialize ChromaDB retriever with empty collection
-        try:
-            # First try to reset the collection if it exists
-            temp_retriever = ChromaRetriever(collection_name="memories",model_name=self.model_name)
-            temp_retriever.client.reset()
-        except Exception as e:
-            logger.warning(f"Could not reset ChromaDB collection: {e}")
+        self.persist_dir = persist_dir
 
-        # Create a fresh retriever instance
-        self.retriever = ChromaRetriever(collection_name="memories",model_name=self.model_name)
+        # Set up subdirectories for persistence
+        self._notes_dir = None
+        self._chroma_dir = None
+        if self.persist_dir:
+            self._notes_dir = os.path.join(self.persist_dir, "notes")
+            self._chroma_dir = os.path.join(self.persist_dir, "chroma")
+            os.makedirs(self._notes_dir, exist_ok=True)
+            os.makedirs(self._chroma_dir, exist_ok=True)
+
+        if self.persist_dir:
+            # Persistent mode: load existing data
+            self.retriever = ChromaRetriever(
+                collection_name="memories", model_name=self.model_name,
+                persist_dir=self._chroma_dir
+            )
+            self._load_notes()
+        else:
+            # In-memory mode: reset and start fresh (original behavior)
+            try:
+                temp_retriever = ChromaRetriever(collection_name="memories", model_name=self.model_name)
+                temp_retriever.client.reset()
+            except Exception as e:
+                logger.warning(f"Could not reset ChromaDB collection: {e}")
+            self.retriever = ChromaRetriever(collection_name="memories", model_name=self.model_name)
 
         # Initialize LLM controller
         self.llm_controller = LLMController(llm_backend, llm_model, api_key, sglang_host, sglang_port)
         self.evo_cnt = 0
         self.evo_threshold = evo_threshold
+
+    # --- Persistence helpers ---
+
+    def _save_note(self, note: MemoryNote):
+        """Save a single MemoryNote as a markdown file."""
+        if not self._notes_dir:
+            return
+        filepath = os.path.join(self._notes_dir, f"{note.filename}.md")
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(note.to_markdown())
+
+    def _delete_note_file(self, memory_id: str):
+        """Delete a MemoryNote's markdown file."""
+        if not self._notes_dir:
+            return
+        note = self.memories.get(memory_id)
+        if note:
+            filepath = os.path.join(self._notes_dir, f"{note.filename}.md")
+            if os.path.exists(filepath):
+                os.remove(filepath)
+
+    def _load_notes(self):
+        """Load all MemoryNotes from markdown files in the notes directory."""
+        if not self._notes_dir:
+            return
+        for filename in os.listdir(self._notes_dir):
+            if not filename.endswith(".md"):
+                continue
+            filepath = os.path.join(self._notes_dir, filename)
+            with open(filepath, "r", encoding="utf-8") as f:
+                text = f.read()
+            try:
+                note = MemoryNote.from_markdown(text)
+                self.memories[note.id] = note
+            except Exception as e:
+                logger.warning(f"Could not load note {filename}: {e}")
 
         # Evolution system prompt
         self._evolution_system_prompt = '''
@@ -206,13 +335,18 @@ class AgenticMemorySystem:
             }
 
         prompt = f"""Generate a structured analysis of the following content by:
-            1. Identifying the most salient keywords (focus on nouns, verbs, and key concepts)
-            2. Extracting core themes and contextual elements
-            3. Creating relevant categorical tags
+            1. Creating a short, descriptive name (2-5 words, lowercase, like a file name)
+            2. Identifying the most salient keywords (focus on nouns, verbs, and key concepts)
+            3. Extracting core themes and contextual elements
+            4. Creating relevant categorical tags
             {summary_instruction}
 
             Format the response as a JSON object:
             {{
+                "name":
+                    // a short descriptive name for this memory (2-5 words, lowercase)
+                    // e.g. "docker container basics", "postgresql jsonb indexing"
+                ,
                 "keywords": [
                     // several specific, distinct keywords that capture key concepts and terminology
                     // Order from most to least important
@@ -236,6 +370,9 @@ class AgenticMemorySystem:
             {content}"""
 
         schema_properties = {
+            "name": {
+                "type": "string",
+            },
             "keywords": {
                 "type": "array",
                 "items": {"type": "string"}
@@ -281,6 +418,8 @@ class AgenticMemorySystem:
             analysis = self.analyze_content(content)
 
             # Only update attributes that are not provided or have default values
+            if note.name is None:
+                note.name = analysis.get("name")
             if not note.keywords:
                 note.keywords = analysis.get("keywords", [])
             if note.context == "General":
@@ -293,7 +432,8 @@ class AgenticMemorySystem:
         # Update retriever with all documents
         evo_label, note = self.process_memory(note)
         self.memories[note.id] = note
-        
+        self._save_note(note)
+
         # Add to ChromaDB with complete metadata
         metadata = {
             "id": note.id,
@@ -320,7 +460,10 @@ class AgenticMemorySystem:
     def consolidate_memories(self):
         """Consolidate memories: update retriever with new documents"""
         # Reset ChromaDB collection
-        self.retriever = ChromaRetriever(collection_name="memories",model_name=self.model_name)
+        self.retriever = ChromaRetriever(
+            collection_name="memories", model_name=self.model_name,
+            persist_dir=self._chroma_dir
+        )
         
         # Re-add all memory documents with their complete metadata
         for memory in self.memories.values():
@@ -457,7 +600,8 @@ class AgenticMemorySystem:
         # Delete and re-add to update
         self.retriever.delete_document(memory_id)
         self.retriever.add_document(document=note.content, metadata=metadata, doc_id=memory_id)
-        
+        self._save_note(note)
+
         return True
     
     def delete(self, memory_id: str) -> bool:
@@ -470,6 +614,8 @@ class AgenticMemorySystem:
             bool: True if memory was deleted, False if not found
         """
         if memory_id in self.memories:
+            # Delete markdown file first (needs note for filename)
+            self._delete_note_file(memory_id)
             # Delete from ChromaDB
             self.retriever.delete_document(memory_id)
             # Delete from local storage
@@ -776,6 +922,7 @@ class AgenticMemorySystem:
 
                                 # Save the updated memory back
                                 self.memories[memory_id] = neighbor_memory
+                                self._save_note(neighbor_memory)
 
                 return should_evolve, note
                 
