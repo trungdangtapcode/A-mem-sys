@@ -1,50 +1,16 @@
-# Giải thích thư mục `tests`
+# Test Architecture
 
-Thư mục này không phải phần logic chính của paper, nhưng nó giúp nhìn nhanh repo đang muốn giữ ổn định những hành vi nào.
+This test suite is split by scope so failures point to the right layer quickly:
 
-## 1. `test_memory_system.py`
+- `tests/unit/`: pure behavior and adapter tests with full mocking.
+- `tests/integration/`: real `AgenticMemorySystem` flows using deterministic in-memory doubles for the LLM and vector store.
+- `tests/stress/`: bulk lifecycle coverage to catch consistency regressions under sustained add, update, link, delete, and rebuild activity.
 
-File này kiểm tra các hành vi cốt lõi của hệ thống bộ nhớ:
+The suite is intentionally deterministic:
 
-- tạo memory mới
-- giữ được metadata sau khi lưu và tìm lại
-- cập nhật memory
-- xóa memory
-- truy hồi memory liên quan
-- xử lý liên kết giữa các memory
-- chạy luồng evolution ở mức cơ bản
+- no network calls
+- no API keys
+- no real Ollama, OpenAI, or SGLang servers
+- no sentence-transformer downloads during test execution
 
-Nói ngắn gọn: file này bảo vệ "hệ thống bộ nhớ có chạy đúng vòng đời chính hay không".
-
-## 2. `test_llm_backends.py`
-
-File này tập trung vào phần backend model, đặc biệt là SGLang:
-
-- khởi tạo backend đúng chưa
-- payload gửi đi có đúng format chưa
-- nếu lỗi mạng hoặc lỗi server thì có fallback hợp lý không
-
-Nói ngắn gọn: file này bảo vệ "phần cầu nối sang LLM có đúng giao thức không".
-
-## 3. `test_utils.py`
-
-File này chứa mock đơn giản để phục vụ test.
-
-## 4. Cách hiểu vai trò của test trong repo này
-
-Nếu đọc repo theo tinh thần paper, test ở đây có ý nghĩa:
-
-- xác nhận memory có thể được tạo và truy hồi
-- xác nhận metadata có đi xuyên qua hệ thống
-- xác nhận cơ chế evolution không làm vỡ flow chính
-- xác nhận các backend LLM có thể được thay mà không đổi logic lõi
-
-## 5. Trạng thái chạy test trong môi trường hiện tại
-
-Mình đã thử chạy:
-
-```bash
-python3 -m unittest
-```
-
-nhưng môi trường hiện tại đang thiếu package `litellm`, nên test chưa thể chạy hết ngay trong phiên này.
+Core test doubles live in [`helpers.py`](/home/tcuong1000/os-twin/A-mem-sys/tests/helpers.py).

@@ -30,6 +30,14 @@ class GeminiEmbeddingFunction(EmbeddingFunction):
         return [item["embedding"] for item in response.data]
 
 
+def _create_embedding_function(embedding_backend: str, model_name: str):
+    """Create an embedding function based on the backend type."""
+    if embedding_backend == "gemini":
+        return GeminiEmbeddingFunction(model_name=model_name)
+    else:
+        return SentenceTransformerEmbeddingFunction(model_name=model_name)
+
+
 class ChromaRetriever:
     """Vector database retrieval using ChromaDB"""
     def __init__(self, collection_name: str = "memories", model_name: str = "all-MiniLM-L6-v2",
@@ -48,11 +56,7 @@ class ChromaRetriever:
             self.client = chromadb.Client(Settings(allow_reset=True))
         self.persist_dir = persist_dir
 
-        if embedding_backend == "gemini":
-            self.embedding_function = GeminiEmbeddingFunction(model_name=model_name)
-        else:
-            self.embedding_function = SentenceTransformerEmbeddingFunction(model_name=model_name)
-
+        self.embedding_function = _create_embedding_function(embedding_backend, model_name)
         self.collection = self.client.get_or_create_collection(name=collection_name, embedding_function=self.embedding_function)
         
     def add_document(self, document: str, metadata: Dict, doc_id: str):
@@ -104,9 +108,16 @@ class ChromaRetriever:
             ids=[doc_id]
         )
         
+    def clear(self):
+        """Delete all documents and recreate the collection."""
+        self.client.delete_collection("memories")
+        self.collection = self.client.get_or_create_collection(
+            name="memories", embedding_function=self.embedding_function
+        )
+
     def delete_document(self, doc_id: str):
         """Delete a document from ChromaDB.
-        
+
         Args:
             doc_id: ID of document to delete
         """
@@ -151,5 +162,146 @@ class ChromaRetriever:
                                 except (json.JSONDecodeError, ValueError):
                                     # If parsing fails, keep the original string
                                     pass
-                        
+
         return results
+
+
+class ZvecRetriever:
+    """Vector database retrieval using Zvec."""
+
+    def __init__(self, collection_name: str = "memories", model_name: str = "all-MiniLM-L6-v2",
+                 persist_dir: str = None, embedding_backend: str = "sentence-transformer"):
+        """Initialize Zvec retriever.
+
+        Args:
+            collection_name: Name of the Zvec collection
+            model_name: Name of the embedding model
+            persist_dir: Directory for persistent storage. Required for Zvec.
+            embedding_backend: "sentence-transformer" or "gemini"
+        """
+        import zvec as _zvec
+        self._zvec = _zvec
+
+        self.embedding_function = _create_embedding_function(embedding_backend, model_name)
+        self.persist_dir = persist_dir
+
+        # Determine embedding dimension by encoding a test string
+        test_embedding = self.embedding_function(["test"])
+        self._dimension = len(test_embedding[0])
+
+        collection_path = os.path.join(persist_dir, collection_name) if persist_dir else os.path.join("/tmp/zvec", collection_name)
+        self._collection_path = collection_path
+
+        if os.path.exists(collection_path):
+            self.collection = _zvec.open(path=collection_path)
+        else:
+            os.makedirs(os.path.dirname(collection_path), exist_ok=True)
+            schema = _zvec.CollectionSchema(
+                name=collection_name,
+                fields=[
+                    _zvec.FieldSchema(name="metadata_json", data_type=_zvec.DataType.STRING),
+                ],
+                vectors=[
+                    _zvec.VectorSchema(
+                        name="embedding",
+                        data_type=_zvec.DataType.VECTOR_FP32,
+                        dimension=self._dimension,
+                        index_param=_zvec.HnswIndexParam(metric_type=_zvec.MetricType.COSINE),
+                    ),
+                ],
+            )
+            self.collection = _zvec.create_and_open(path=collection_path, schema=schema)
+
+    def clear(self):
+        """Delete all documents and recreate the collection."""
+        self.collection.destroy()
+        schema = self._zvec.CollectionSchema(
+            name="memories",
+            fields=[
+                self._zvec.FieldSchema(name="metadata_json", data_type=self._zvec.DataType.STRING),
+            ],
+            vectors=[
+                self._zvec.VectorSchema(
+                    name="embedding",
+                    data_type=self._zvec.DataType.VECTOR_FP32,
+                    dimension=self._dimension,
+                    index_param=self._zvec.HnswIndexParam(metric_type=self._zvec.MetricType.COSINE),
+                ),
+            ],
+        )
+        self.collection = self._zvec.create_and_open(path=self._collection_path, schema=schema)
+
+    def add_document(self, document: str, metadata: dict, doc_id: str):
+        """Add a document to Zvec with enhanced embedding using metadata."""
+        summary = metadata.get('summary')
+        enhanced_document = summary if summary else document
+
+        if 'context' in metadata and metadata['context'] != "General":
+            enhanced_document += f" context: {metadata['context']}"
+        if 'keywords' in metadata and metadata['keywords']:
+            keywords = metadata['keywords'] if isinstance(metadata['keywords'], list) else json.loads(metadata['keywords'])
+            if keywords:
+                enhanced_document += f" keywords: {', '.join(keywords)}"
+        if 'tags' in metadata and metadata['tags']:
+            tags = metadata['tags'] if isinstance(metadata['tags'], list) else json.loads(metadata['tags'])
+            if tags:
+                enhanced_document += f" tags: {', '.join(tags)}"
+
+        # Generate embedding
+        embedding = self.embedding_function([enhanced_document])[0]
+
+        # Serialize metadata to JSON string
+        processed_metadata = {}
+        for key, value in metadata.items():
+            if isinstance(value, (list, dict)):
+                processed_metadata[key] = value
+            elif value is None:
+                processed_metadata[key] = None
+            else:
+                processed_metadata[key] = str(value)
+
+        doc = self._zvec.Doc(
+            id=doc_id,
+            vectors={"embedding": embedding},
+            fields={"metadata_json": json.dumps(processed_metadata, ensure_ascii=False)},
+        )
+        self.collection.insert(doc)
+
+    def delete_document(self, doc_id: str):
+        """Delete a document from Zvec."""
+        self.collection.delete(ids=doc_id)
+
+    def search(self, query: str, k: int = 5):
+        """Search for similar documents. Returns ChromaDB-compatible result format."""
+        embedding = self.embedding_function([query])[0]
+
+        results = self.collection.query(
+            vectors=self._zvec.VectorQuery(field_name="embedding", vector=embedding),
+            topk=k,
+        )
+
+        ids = []
+        metadatas = []
+        distances = []
+
+        for doc in results:
+            ids.append(doc.id)
+            distances.append(doc.score)
+            # Deserialize metadata
+            meta_str = doc.fields.get("metadata_json", "{}")
+            meta = json.loads(meta_str) if isinstance(meta_str, str) else {}
+            # Parse list/dict values
+            for key, value in meta.items():
+                if isinstance(value, str):
+                    try:
+                        if value.startswith('[') or value.startswith('{'):
+                            meta[key] = json.loads(value)
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+            metadatas.append(meta)
+
+        return {
+            'ids': [ids],
+            'metadatas': [metadatas],
+            'distances': [distances],
+        }

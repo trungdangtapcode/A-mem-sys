@@ -208,3 +208,10 @@ __marimo__/
 
 
 .memory/
+.memory/**
+.memory*/
+node_modules/
+frontend/.vite/
+*.tsbuildinfo
+!frontend/src/lib/
+!frontend/src/lib/**

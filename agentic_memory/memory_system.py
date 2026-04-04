@@ -3,7 +3,7 @@ from typing import List, Dict, Optional, Any, Tuple
 import uuid
 from datetime import datetime
 from .llm_controller import LLMController
-from .retrievers import ChromaRetriever
+from .retrievers import ChromaRetriever, ZvecRetriever
 import json
 import logging
 from rank_bm25 import BM25Okapi
@@ -208,6 +208,7 @@ class AgenticMemorySystem:
                  sglang_port: int = 30000,
                  persist_dir: Optional[str] = None,
                  embedding_backend: str = "sentence-transformer",
+                 vector_backend: str = "chroma",
                  context_aware_analysis: bool = False,
                  context_aware_tree: bool = False,
                  max_links: Optional[int] = None):
@@ -223,6 +224,7 @@ class AgenticMemorySystem:
             sglang_port: Port for SGLang server (default: 30000)
             persist_dir: Directory for persistent storage. If None, uses in-memory mode.
             embedding_backend: Embedding backend ("sentence-transformer" or "gemini")
+            vector_backend: Vector database backend ("chroma" or "zvec")
             context_aware_analysis: When True, analyze_content sees similar memories
                 and directory paths to keep naming/categorization consistent.
             context_aware_tree: When True (requires context_aware_analysis=True),
@@ -235,45 +237,54 @@ class AgenticMemorySystem:
         self.model_name = model_name
         self.persist_dir = persist_dir
         self.embedding_backend = embedding_backend
+        self.vector_backend = vector_backend
         self.context_aware_analysis = context_aware_analysis
         self.context_aware_tree = context_aware_tree
         self.max_links = max_links
+        self._initialize_evolution_prompt()
 
         # Set up subdirectories for persistence
         self._notes_dir = None
-        self._chroma_dir = None
+        self._vector_dir = None
         if self.persist_dir:
             self._notes_dir = os.path.join(self.persist_dir, "notes")
-            self._chroma_dir = os.path.join(self.persist_dir, "chroma")
+            self._vector_dir = os.path.join(self.persist_dir, "vectordb")
             os.makedirs(self._notes_dir, exist_ok=True)
-            os.makedirs(self._chroma_dir, exist_ok=True)
+            os.makedirs(self._vector_dir, exist_ok=True)
 
-        if self.persist_dir:
-            # Persistent mode: load existing data
-            self.retriever = ChromaRetriever(
-                collection_name="memories", model_name=self.model_name,
-                persist_dir=self._chroma_dir, embedding_backend=self.embedding_backend
-            )
-            self._load_notes()
-        else:
-            # In-memory mode: reset and start fresh (original behavior)
+        if not self.persist_dir and self.vector_backend == "chroma":
+            # In-memory mode: reset old ChromaDB collection
             try:
-                temp_retriever = ChromaRetriever(
+                temp = ChromaRetriever(
                     collection_name="memories", model_name=self.model_name,
                     embedding_backend=self.embedding_backend
                 )
-                temp_retriever.client.reset()
+                temp.client.reset()
             except Exception as e:
                 logger.warning(f"Could not reset ChromaDB collection: {e}")
-            self.retriever = ChromaRetriever(
-                collection_name="memories", model_name=self.model_name,
-                embedding_backend=self.embedding_backend
-            )
+
+        self.retriever = self._create_retriever()
+
+        if self.persist_dir:
+            self._load_notes()
 
         # Initialize LLM controller
         self.llm_controller = LLMController(llm_backend, llm_model, api_key, sglang_host, sglang_port)
         self.evo_cnt = 0
         self.evo_threshold = evo_threshold
+
+    def _create_retriever(self):
+        """Create the vector retriever based on configured backend."""
+        if self.vector_backend == "zvec":
+            return ZvecRetriever(
+                collection_name="memories", model_name=self.model_name,
+                persist_dir=self._vector_dir, embedding_backend=self.embedding_backend
+            )
+        else:
+            return ChromaRetriever(
+                collection_name="memories", model_name=self.model_name,
+                persist_dir=self._vector_dir, embedding_backend=self.embedding_backend
+            )
 
     # --- Persistence helpers ---
 
@@ -342,7 +353,10 @@ class AgenticMemorySystem:
                 note.links = valid_links
                 self._save_note(note)
 
-        # Evolution system prompt
+        self._initialize_evolution_prompt()
+
+    def _initialize_evolution_prompt(self):
+        """Initialize the prompt used by the memory evolution flow."""
         self._evolution_system_prompt = '''
                                 You are an AI memory evolution agent responsible for managing and evolving a knowledge base.
                                 Analyze the the new memory note according to keywords and context, also with their several nearest neighbors memory.
@@ -374,7 +388,7 @@ class AgenticMemorySystem:
                                     "new_tags_neighborhood": [["tag_1",...,"tag_n"],...["tag_1",...,"tag_n"]],
                                 }}
                                 '''
-        
+
     # Approximate word count threshold for generating summary.
     # all-MiniLM-L6-v2 supports 256 tokens; enhanced_document appends
     # gemini embedding truncates to 512 tokens. To leave room for metadata like
@@ -633,14 +647,114 @@ class AgenticMemorySystem:
                 self.consolidate_memories()
         return note.id
     
+    def sync_from_disk(self) -> Dict:
+        """Sync: read current persistent files → update in-memory state + vectordb.
+
+        Loads all markdown files from disk, detects added/modified/deleted notes
+        compared to current in-memory state, and rebuilds the vector index.
+
+        Caveats:
+        - Notes that exist on disk but not in memory are ADDED.
+        - Notes that exist in memory but not on disk are REMOVED.
+        - Notes whose content differs on disk are UPDATED (disk wins).
+        - Vector index is fully rebuilt after sync.
+        - Backlinks are rebuilt from forward links.
+
+        Returns:
+            Dict with counts of added, updated, removed notes.
+        """
+        if not self._notes_dir:
+            return {"error": "No persist_dir configured"}
+
+        # Load all notes from disk
+        disk_notes = {}
+        for dirpath, _dirnames, filenames in os.walk(self._notes_dir):
+            for filename in filenames:
+                if not filename.endswith(".md"):
+                    continue
+                filepath = os.path.join(dirpath, filename)
+                with open(filepath, "r", encoding="utf-8") as f:
+                    text = f.read()
+                try:
+                    note = MemoryNote.from_markdown(text)
+                    disk_notes[note.id] = note
+                except Exception as e:
+                    logger.warning(f"Could not load note {filepath}: {e}")
+
+        added = 0
+        updated = 0
+        removed = 0
+
+        # Detect added and updated
+        for nid, disk_note in disk_notes.items():
+            if nid not in self.memories:
+                added += 1
+            elif disk_note.content != self.memories[nid].content:
+                updated += 1
+            self.memories[nid] = disk_note
+
+        # Detect removed (in memory but not on disk)
+        removed_ids = [nid for nid in self.memories if nid not in disk_notes]
+        for nid in removed_ids:
+            del self.memories[nid]
+            removed += 1
+
+        # Rebuild backlinks and vector index
+        self._rebuild_backlinks()
+        self.consolidate_memories()
+
+        return {"added": added, "updated": updated, "removed": removed}
+
+    def sync_to_disk(self) -> Dict:
+        """Sync: write current in-memory state → persistent files + vectordb.
+
+        Saves all in-memory notes as markdown files, removes orphan files
+        that don't correspond to any in-memory note, and rebuilds the vector index.
+
+        Returns:
+            Dict with counts of written and cleaned files.
+        """
+        if not self._notes_dir:
+            return {"error": "No persist_dir configured"}
+
+        # Collect all existing .md filepaths on disk
+        existing_files = set()
+        for dirpath, _dirnames, filenames in os.walk(self._notes_dir):
+            for filename in filenames:
+                if filename.endswith(".md"):
+                    existing_files.add(os.path.join(dirpath, filename))
+
+        # Write all in-memory notes to disk
+        written_files = set()
+        for note in self.memories.values():
+            filepath = os.path.join(self._notes_dir, note.filepath)
+            os.makedirs(os.path.dirname(filepath), exist_ok=True)
+            with open(filepath, "w", encoding="utf-8") as f:
+                f.write(note.to_markdown())
+            written_files.add(filepath)
+
+        # Remove orphan files (on disk but not in memory)
+        orphans = existing_files - written_files
+        for orphan_path in orphans:
+            os.remove(orphan_path)
+            # Clean empty parent dirs
+            parent = os.path.dirname(orphan_path)
+            while parent != self._notes_dir:
+                if os.path.isdir(parent) and not os.listdir(parent):
+                    os.rmdir(parent)
+                    parent = os.path.dirname(parent)
+                else:
+                    break
+
+        # Rebuild vector index from memory
+        self.consolidate_memories()
+
+        return {"written": len(written_files), "orphans_removed": len(orphans)}
+
     def consolidate_memories(self):
-        """Consolidate memories: update retriever with new documents"""
-        # Reset ChromaDB collection
-        self.retriever = ChromaRetriever(
-            collection_name="memories", model_name=self.model_name,
-            persist_dir=self._chroma_dir, embedding_backend=self.embedding_backend
-        )
-        
+        """Consolidate memories: rebuild the vector index from current in-memory state."""
+        self.retriever.clear()
+
         # Re-add all memory documents with their complete metadata
         for memory in self.memories.values():
             metadata = {
