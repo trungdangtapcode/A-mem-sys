@@ -33,7 +33,7 @@ class MemoryNote:
     - Evolution tracking (history of changes)
     """
     
-    def __init__(self, 
+    def __init__(self,
                  content: str,
                  id: Optional[str] = None,
                  keywords: Optional[List[str]] = None,
@@ -44,9 +44,10 @@ class MemoryNote:
                  context: Optional[str] = None,
                  evolution_history: Optional[List] = None,
                  category: Optional[str] = None,
-                 tags: Optional[List[str]] = None):
+                 tags: Optional[List[str]] = None,
+                 summary: Optional[str] = None):
         """Initialize a new memory note with its associated metadata.
-        
+
         Args:
             content (str): The main text content of the memory
             id (Optional[str]): Unique identifier for the memory. If None, a UUID will be generated
@@ -59,6 +60,7 @@ class MemoryNote:
             evolution_history (Optional[List]): Record of how the memory has evolved
             category (Optional[str]): Classification category
             tags (Optional[List[str]]): Additional classification tags
+            summary (Optional[str]): Short summary for embedding when content exceeds token limit
         """
         # Core content and ID
         self.content = content
@@ -79,6 +81,9 @@ class MemoryNote:
         # Usage and evolution data
         self.retrieval_count = retrieval_count or 0
         self.evolution_history = evolution_history or []
+
+        # Summary for long content embedding
+        self.summary = summary
 
 class AgenticMemorySystem:
     """Core memory system that manages memory notes and their evolution.
@@ -160,37 +165,61 @@ class AgenticMemorySystem:
                                 }}
                                 '''
         
-    def analyze_content(self, content: str) -> Dict:            
+    # Approximate word count threshold for generating summary.
+    # all-MiniLM-L6-v2 supports 256 tokens; enhanced_document appends
+    # context/keywords/tags, so we reserve ~100 tokens for metadata
+    # and use ~150 words as the content threshold.
+    SUMMARY_WORD_THRESHOLD = 150
+
+    def analyze_content(self, content: str) -> Dict:
         """Analyze content using LLM to extract semantic metadata.
-        
+
         Uses a language model to understand the content and extract:
         - Keywords: Important terms and concepts
         - Context: Overall domain or theme
         - Tags: Classification categories
-        
+        - Summary: A concise summary when content exceeds the embedding token limit
+
         Args:
             content (str): The text content to analyze
-            
+
         Returns:
             Dict: Contains extracted metadata with keys:
                 - keywords: List[str]
                 - context: str
                 - tags: List[str]
+                - summary: Optional[str] (only when content is long)
         """
-        prompt = """Generate a structured analysis of the following content by:
+        needs_summary = len(content.split()) > self.SUMMARY_WORD_THRESHOLD
+
+        summary_instruction = ""
+        summary_schema = {}
+        if needs_summary:
+            summary_instruction = """
+            4. Writing a concise summary (2-3 sentences, under 100 words) that captures
+               the key information. This summary will be used for semantic search embedding,
+               so it must preserve the most important concepts and terms."""
+            summary_schema = {
+                "summary": {
+                    "type": "string",
+                }
+            }
+
+        prompt = f"""Generate a structured analysis of the following content by:
             1. Identifying the most salient keywords (focus on nouns, verbs, and key concepts)
             2. Extracting core themes and contextual elements
             3. Creating relevant categorical tags
+            {summary_instruction}
 
             Format the response as a JSON object:
-            {
+            {{
                 "keywords": [
                     // several specific, distinct keywords that capture key concepts and terminology
                     // Order from most to least important
                     // Don't include keywords that are the name of the speaker or time
                     // At least three keywords, but don't be too redundant.
                 ],
-                "context": 
+                "context":
                     // one sentence summarizing:
                     // - Main topic/domain
                     // - Key arguments/points
@@ -200,33 +229,33 @@ class AgenticMemorySystem:
                     // several broad categories/themes for classification
                     // Include domain, format, and type tags
                     // At least three tags, but don't be too redundant.
-                ]
-            }
+                ]{', "summary": "..."' if needs_summary else ''}
+            }}
 
             Content for analysis:
-            """ + content
+            {content}"""
+
+        schema_properties = {
+            "keywords": {
+                "type": "array",
+                "items": {"type": "string"}
+            },
+            "context": {
+                "type": "string",
+            },
+            "tags": {
+                "type": "array",
+                "items": {"type": "string"}
+            },
+        }
+        schema_properties.update(summary_schema)
+
         try:
             response = self.llm_controller.llm.get_completion(prompt, response_format={"type": "json_schema", "json_schema": {
                         "name": "response",
                         "schema": {
                             "type": "object",
-                            "properties": {
-                                "keywords": {
-                                    "type": "array",
-                                    "items": {
-                                        "type": "string"
-                                    }
-                                },
-                                "context": {
-                                    "type": "string",
-                                },
-                                "tags": {
-                                    "type": "array",
-                                    "items": {
-                                        "type": "string"
-                                    }
-                                }
-                            }
+                            "properties": schema_properties
                         }
                     }})
             return json.loads(response)
@@ -249,19 +278,17 @@ class AgenticMemorySystem:
         )
         
         if needs_analysis:
-            # try:
             analysis = self.analyze_content(content)
-            
+
             # Only update attributes that are not provided or have default values
             if not note.keywords:
                 note.keywords = analysis.get("keywords", [])
             if note.context == "General":
-                note.context = analysis.get("context", "General") 
+                note.context = analysis.get("context", "General")
             if not note.tags:
                 note.tags = analysis.get("tags", [])
-                    
-            # except Exception as e:
-            #     print(f"Warning: LLM analysis failed, using default values: {e}")
+            if note.summary is None:
+                note.summary = analysis.get("summary")
         
         # Update retriever with all documents
         evo_label, note = self.process_memory(note)
@@ -279,7 +306,8 @@ class AgenticMemorySystem:
             "context": note.context,
             "evolution_history": note.evolution_history,
             "category": note.category,
-            "tags": note.tags
+            "tags": note.tags,
+            "summary": note.summary
         }
         self.retriever.add_document(note.content, metadata, note.id)
         
@@ -307,7 +335,8 @@ class AgenticMemorySystem:
                 "context": memory.context,
                 "evolution_history": memory.evolution_history,
                 "category": memory.category,
-                "tags": memory.tags
+                "tags": memory.tags,
+                "summary": memory.summary
             }
             self.retriever.add_document(memory.content, metadata, memory.id)
     
@@ -385,7 +414,7 @@ class AgenticMemorySystem:
         return self.memories.get(memory_id)
     
     def update(self, memory_id: str, **kwargs) -> bool:
-        """Update a memory note.
+        """Update a memory note. 
         
         Args:
             memory_id: ID of memory to update
@@ -404,6 +433,11 @@ class AgenticMemorySystem:
             if hasattr(note, key):
                 setattr(note, key, value)
                 
+        # Re-generate summary if content was updated and is long
+        if 'content' in kwargs and note.summary is not None:
+            analysis = self.analyze_content(note.content)
+            note.summary = analysis.get("summary")
+
         # Update in ChromaDB
         metadata = {
             "id": note.id,
@@ -416,9 +450,10 @@ class AgenticMemorySystem:
             "context": note.context,
             "evolution_history": note.evolution_history,
             "category": note.category,
-            "tags": note.tags
+            "tags": note.tags,
+            "summary": note.summary
         }
-        
+
         # Delete and re-add to update
         self.retriever.delete_document(memory_id)
         self.retriever.add_document(document=note.content, metadata=metadata, doc_id=memory_id)

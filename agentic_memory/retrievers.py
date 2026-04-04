@@ -29,14 +29,16 @@ class ChromaRetriever:
         
     def add_document(self, document: str, metadata: Dict, doc_id: str):
         """Add a document to ChromaDB with enhanced embedding using metadata.
-        
+
         Args:
             document: Text content to add
             metadata: Dictionary of metadata including keywords, tags, context
             doc_id: Unique identifier for the document
         """
-        # Build enhanced document content including semantic metadata
-        enhanced_document = document
+        # Use summary for embedding when available (long content),
+        # otherwise use original content
+        summary = metadata.get('summary')
+        enhanced_document = summary if summary else document
         
         # Add context information
         if 'context' in metadata and metadata['context'] != "General":
