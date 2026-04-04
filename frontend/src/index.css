@@ -1,0 +1,131 @@
+@import "tailwindcss";
+
+@theme inline {
+  --font-sans: "Space Grotesk", "Avenir Next", "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono", "SFMono-Regular", "Consolas", monospace;
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+}
+
+:root {
+  --background: #111214;
+  --foreground: #f2f3f5;
+  --card: rgba(24, 25, 30, 0.92);
+  --card-foreground: #f2f3f5;
+  --popover: rgba(23, 24, 29, 0.98);
+  --popover-foreground: #f2f3f5;
+  --primary: #8b5cf6;
+  --primary-foreground: #f8f6ff;
+  --secondary: rgba(43, 45, 51, 0.95);
+  --secondary-foreground: #f0f1f4;
+  --muted: rgba(31, 32, 37, 0.84);
+  --muted-foreground: #a6a8b3;
+  --accent: rgba(38, 41, 48, 0.92);
+  --accent-foreground: #f3f4f7;
+  --destructive: #ef4444;
+  --destructive-foreground: #fff4f4;
+  --border: rgba(255, 255, 255, 0.08);
+  --input: rgba(255, 255, 255, 0.08);
+  --ring: rgba(139, 92, 246, 0.45);
+}
+
+* {
+  border-color: var(--border);
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  background:
+    radial-gradient(circle at top, rgba(139, 92, 246, 0.08), transparent 28%),
+    radial-gradient(circle at bottom left, rgba(59, 130, 246, 0.08), transparent 22%),
+    linear-gradient(180deg, #131417 0%, #0d0e11 100%);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+}
+
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background-image:
+    linear-gradient(rgba(255, 255, 255, 0.02) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.02) 1px, transparent 1px);
+  background-size: 32px 32px;
+  mask-image: radial-gradient(circle at center, black 40%, transparent 95%);
+  opacity: 0.28;
+}
+
+button,
+input {
+  font: inherit;
+}
+
+.panel-sheen {
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.06), transparent 16%),
+    rgba(21, 22, 27, 0.92);
+}
+
+.obsidian-scrollbar {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(148, 163, 184, 0.35) transparent;
+}
+
+.obsidian-scrollbar::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+.obsidian-scrollbar::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.26);
+  border-radius: 999px;
+}
+
+@keyframes accordion-down {
+  from {
+    height: 0;
+  }
+  to {
+    height: var(--radix-accordion-content-height);
+  }
+}
+
+@keyframes accordion-up {
+  from {
+    height: var(--radix-accordion-content-height);
+  }
+  to {
+    height: 0;
+  }
+}
+
+.accordion-content[data-state="open"] {
+  animation: accordion-down 180ms ease-out;
+}
+
+.accordion-content[data-state="closed"] {
+  animation: accordion-up 180ms ease-out;
+}
