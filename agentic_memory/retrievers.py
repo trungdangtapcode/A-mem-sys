@@ -11,27 +11,48 @@ from nltk.tokenize import word_tokenize
 import os
 import json
 from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
+from chromadb.api.types import EmbeddingFunction, Documents, Embeddings
+import litellm
+
 
 def simple_tokenize(text):
     return word_tokenize(text)
 
+
+class GeminiEmbeddingFunction(EmbeddingFunction):
+    """ChromaDB embedding function using Gemini embedding models via litellm."""
+
+    def __init__(self, model_name: str = "gemini-embedding-001"):
+        self.model_name = f"gemini/{model_name}" if not model_name.startswith("gemini/") else model_name
+
+    def __call__(self, input: Documents) -> Embeddings:
+        response = litellm.embedding(model=self.model_name, input=input)
+        return [item["embedding"] for item in response.data]
+
+
 class ChromaRetriever:
     """Vector database retrieval using ChromaDB"""
     def __init__(self, collection_name: str = "memories", model_name: str = "all-MiniLM-L6-v2",
-                 persist_dir: str = None):
+                 persist_dir: str = None, embedding_backend: str = "sentence-transformer"):
         """Initialize ChromaDB retriever.
 
         Args:
             collection_name: Name of the ChromaDB collection
-            model_name: Name of the sentence transformer model
+            model_name: Name of the embedding model
             persist_dir: Directory for persistent storage. If None, uses in-memory mode.
+            embedding_backend: "sentence-transformer" or "gemini"
         """
         if persist_dir:
             self.client = chromadb.PersistentClient(path=persist_dir)
         else:
             self.client = chromadb.Client(Settings(allow_reset=True))
         self.persist_dir = persist_dir
-        self.embedding_function = SentenceTransformerEmbeddingFunction(model_name=model_name)
+
+        if embedding_backend == "gemini":
+            self.embedding_function = GeminiEmbeddingFunction(model_name=model_name)
+        else:
+            self.embedding_function = SentenceTransformerEmbeddingFunction(model_name=model_name)
+
         self.collection = self.client.get_or_create_collection(name=collection_name, embedding_function=self.embedding_function)
         
     def add_document(self, document: str, metadata: Dict, doc_id: str):

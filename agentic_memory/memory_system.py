@@ -37,8 +37,10 @@ class MemoryNote:
                  content: str,
                  id: Optional[str] = None,
                  name: Optional[str] = None,
+                 path: Optional[str] = None,
                  keywords: Optional[List[str]] = None,
-                 links: Optional[Dict] = None,
+                 links: Optional[List[str]] = None,
+                 backlinks: Optional[List[str]] = None,
                  retrieval_count: Optional[int] = None,
                  timestamp: Optional[str] = None,
                  last_accessed: Optional[str] = None,
@@ -53,8 +55,11 @@ class MemoryNote:
             content (str): The main text content of the memory
             id (Optional[str]): Unique identifier for the memory. If None, a UUID will be generated
             name (Optional[str]): Human-readable name for the memory (used as filename)
+            path (Optional[str]): Directory path for organizing memory in a tree
+                (e.g. "devops/kubernetes", "backend/database")
             keywords (Optional[List[str]]): Key terms extracted from the content
-            links (Optional[Dict]): References to related memories
+            links (Optional[List[str]]): Active references to other memories (can be added/removed)
+            backlinks (Optional[List[str]]): Passive references from other memories (auto-maintained)
             retrieval_count (Optional[int]): Number of times this memory has been accessed
             timestamp (Optional[str]): Creation time in format YYYYMMDDHHMM
             last_accessed (Optional[str]): Last access time in format YYYYMMDDHHMM
@@ -68,10 +73,12 @@ class MemoryNote:
         self.content = content
         self.id = id or str(uuid.uuid4())
         self.name = name
-        
+        self.path = path
+
         # Semantic metadata
         self.keywords = keywords or []
         self.links = links or []
+        self.backlinks = backlinks or []
         self.context = context or "General"
         self.category = category or "Uncategorized"
         self.tags = tags or []
@@ -88,24 +95,44 @@ class MemoryNote:
         # Summary for long content embedding
         self.summary = summary
 
+    @staticmethod
+    def _slugify(text: str) -> str:
+        """Convert text to a filesystem-safe slug."""
+        import re
+        slug = text.lower().strip()
+        slug = re.sub(r'[^\w\s-]', '', slug)
+        slug = re.sub(r'[\s_]+', '-', slug)
+        return slug.strip('-')
+
     @property
     def filename(self) -> str:
         """Generate a filesystem-safe filename from the name, falling back to id."""
         if not self.name:
             return self.id
-        # Lowercase, replace spaces/special chars with hyphens
-        import re
-        slug = self.name.lower().strip()
-        slug = re.sub(r'[^\w\s-]', '', slug)
-        slug = re.sub(r'[\s_]+', '-', slug)
-        slug = slug.strip('-')
-        return slug or self.id
+        return self._slugify(self.name) or self.id
+
+    @property
+    def filepath(self) -> str:
+        """Generate the relative file path including directory tree.
+
+        Returns path like 'devops/kubernetes/container-orchestration.md'
+        or just 'container-orchestration.md' if no path is set.
+        """
+        name_slug = self.filename
+        if self.path:
+            # Slugify each segment of the path
+            segments = [self._slugify(s) for s in self.path.strip("/").split("/") if s.strip()]
+            segments = [s for s in segments if s]  # remove empty
+            if segments:
+                return os.path.join(*segments, f"{name_slug}.md")
+        return f"{name_slug}.md"
 
     def to_markdown(self) -> str:
         """Serialize this note to a markdown string with YAML frontmatter."""
         frontmatter = {
             "id": self.id,
             "name": self.name,
+            "path": self.path,
             "keywords": self.keywords,
             "links": self.links,
             "retrieval_count": self.retrieval_count,
@@ -147,6 +174,7 @@ class MemoryNote:
             content=content,
             id=metadata.get("id"),
             name=metadata.get("name"),
+            path=metadata.get("path"),
             keywords=metadata.get("keywords"),
             links=metadata.get("links"),
             retrieval_count=metadata.get("retrieval_count"),
@@ -178,11 +206,15 @@ class AgenticMemorySystem:
                  api_key: Optional[str] = None,
                  sglang_host: str = "http://localhost",
                  sglang_port: int = 30000,
-                 persist_dir: Optional[str] = None):
+                 persist_dir: Optional[str] = None,
+                 embedding_backend: str = "sentence-transformer",
+                 context_aware_analysis: bool = False,
+                 context_aware_tree: bool = False,
+                 max_links: Optional[int] = None):
         """Initialize the memory system.
 
         Args:
-            model_name: Name of the sentence transformer model
+            model_name: Name of the embedding model
             llm_backend: LLM backend to use (openai/ollama/sglang/gemini)
             llm_model: Name of the LLM model
             evo_threshold: Number of memories before triggering evolution
@@ -190,10 +222,22 @@ class AgenticMemorySystem:
             sglang_host: Host URL for SGLang server (default: http://localhost)
             sglang_port: Port for SGLang server (default: 30000)
             persist_dir: Directory for persistent storage. If None, uses in-memory mode.
+            embedding_backend: Embedding backend ("sentence-transformer" or "gemini")
+            context_aware_analysis: When True, analyze_content sees similar memories
+                and directory paths to keep naming/categorization consistent.
+            context_aware_tree: When True (requires context_aware_analysis=True),
+                include full directory tree in analysis context so LLM can see
+                the complete knowledge structure for better linking and placement.
+            max_links: Maximum number of links created per note during evolution.
+                If None, no limit (LLM decides freely).
         """
         self.memories = {}
         self.model_name = model_name
         self.persist_dir = persist_dir
+        self.embedding_backend = embedding_backend
+        self.context_aware_analysis = context_aware_analysis
+        self.context_aware_tree = context_aware_tree
+        self.max_links = max_links
 
         # Set up subdirectories for persistence
         self._notes_dir = None
@@ -208,17 +252,23 @@ class AgenticMemorySystem:
             # Persistent mode: load existing data
             self.retriever = ChromaRetriever(
                 collection_name="memories", model_name=self.model_name,
-                persist_dir=self._chroma_dir
+                persist_dir=self._chroma_dir, embedding_backend=self.embedding_backend
             )
             self._load_notes()
         else:
             # In-memory mode: reset and start fresh (original behavior)
             try:
-                temp_retriever = ChromaRetriever(collection_name="memories", model_name=self.model_name)
+                temp_retriever = ChromaRetriever(
+                    collection_name="memories", model_name=self.model_name,
+                    embedding_backend=self.embedding_backend
+                )
                 temp_retriever.client.reset()
             except Exception as e:
                 logger.warning(f"Could not reset ChromaDB collection: {e}")
-            self.retriever = ChromaRetriever(collection_name="memories", model_name=self.model_name)
+            self.retriever = ChromaRetriever(
+                collection_name="memories", model_name=self.model_name,
+                embedding_backend=self.embedding_backend
+            )
 
         # Initialize LLM controller
         self.llm_controller = LLMController(llm_backend, llm_model, api_key, sglang_host, sglang_port)
@@ -228,38 +278,69 @@ class AgenticMemorySystem:
     # --- Persistence helpers ---
 
     def _save_note(self, note: MemoryNote):
-        """Save a single MemoryNote as a markdown file."""
+        """Save a single MemoryNote as a markdown file in its directory tree."""
         if not self._notes_dir:
             return
-        filepath = os.path.join(self._notes_dir, f"{note.filename}.md")
+        filepath = os.path.join(self._notes_dir, note.filepath)
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
         with open(filepath, "w", encoding="utf-8") as f:
             f.write(note.to_markdown())
 
     def _delete_note_file(self, memory_id: str):
-        """Delete a MemoryNote's markdown file."""
+        """Delete a MemoryNote's markdown file and clean up empty parent dirs."""
         if not self._notes_dir:
             return
         note = self.memories.get(memory_id)
         if note:
-            filepath = os.path.join(self._notes_dir, f"{note.filename}.md")
+            filepath = os.path.join(self._notes_dir, note.filepath)
             if os.path.exists(filepath):
                 os.remove(filepath)
+                # Clean up empty parent directories
+                parent = os.path.dirname(filepath)
+                while parent != self._notes_dir:
+                    if os.path.isdir(parent) and not os.listdir(parent):
+                        os.rmdir(parent)
+                        parent = os.path.dirname(parent)
+                    else:
+                        break
 
     def _load_notes(self):
-        """Load all MemoryNotes from markdown files in the notes directory."""
+        """Load all MemoryNotes from markdown files in the notes directory tree."""
         if not self._notes_dir:
             return
-        for filename in os.listdir(self._notes_dir):
-            if not filename.endswith(".md"):
-                continue
-            filepath = os.path.join(self._notes_dir, filename)
-            with open(filepath, "r", encoding="utf-8") as f:
-                text = f.read()
-            try:
-                note = MemoryNote.from_markdown(text)
-                self.memories[note.id] = note
-            except Exception as e:
-                logger.warning(f"Could not load note {filename}: {e}")
+        for dirpath, _dirnames, filenames in os.walk(self._notes_dir):
+            for filename in filenames:
+                if not filename.endswith(".md"):
+                    continue
+                filepath = os.path.join(dirpath, filename)
+                with open(filepath, "r", encoding="utf-8") as f:
+                    text = f.read()
+                try:
+                    note = MemoryNote.from_markdown(text)
+                    self.memories[note.id] = note
+                except Exception as e:
+                    logger.warning(f"Could not load note {filepath}: {e}")
+
+        # Rebuild backlinks from links (backlinks are never persisted)
+        self._rebuild_backlinks()
+
+    def _rebuild_backlinks(self):
+        """Derive all backlinks from forward links. Also prunes dead links."""
+        # Clear all backlinks
+        for note in self.memories.values():
+            note.backlinks = []
+
+        # Rebuild: if A.links contains B, then B.backlinks gets A
+        for note in self.memories.values():
+            valid_links = []
+            for linked_id in note.links:
+                if linked_id in self.memories:
+                    valid_links.append(linked_id)
+                    self.memories[linked_id].backlinks.append(note.id)
+            # Prune links to notes that no longer exist
+            if len(valid_links) != len(note.links):
+                note.links = valid_links
+                self._save_note(note)
 
         # Evolution system prompt
         self._evolution_system_prompt = '''
@@ -296,9 +377,80 @@ class AgenticMemorySystem:
         
     # Approximate word count threshold for generating summary.
     # all-MiniLM-L6-v2 supports 256 tokens; enhanced_document appends
+    # gemini embedding truncates to 512 tokens. To leave room for metadata like
     # context/keywords/tags, so we reserve ~100 tokens for metadata
-    # and use ~150 words as the content threshold.
-    SUMMARY_WORD_THRESHOLD = 150
+    # and use ~250 words as the content threshold.
+    SUMMARY_WORD_THRESHOLD = 250
+
+    def tree(self) -> str:
+        """Generate a tree-like string of the memory directory structure."""
+        if not self.memories:
+            return "(empty)"
+
+        # Build nested dict from all note filepaths
+        root = {}
+        for mem in sorted(self.memories.values(), key=lambda m: m.filepath):
+            parts = mem.filepath.split(os.sep)
+            node = root
+            for part in parts:
+                node = node.setdefault(part, {})
+
+        def _render(node, prefix="", is_last=True):
+            lines = []
+            items = list(node.items())
+            for i, (name, children) in enumerate(items):
+                last = (i == len(items) - 1)
+                connector = "└── " if last else "├── "
+                lines.append(f"{prefix}{connector}{name}")
+                if children:
+                    extension = "    " if last else "│   "
+                    lines.extend(_render(children, prefix + extension, last))
+            return lines
+
+        return "\n".join(_render(root))
+
+    def _get_existing_context(self, content: str, include_tree: bool = False) -> str:
+        """Collect context from similar memories and existing directory structure.
+
+        Args:
+            content: The note content to find similar memories for.
+            include_tree: If True, include full directory tree in context.
+        """
+        if not self.memories:
+            return ""
+
+        lines = []
+
+        # 1. Find similar memories via vector search
+        try:
+            results = self.retriever.search(content, k=5)
+            if results.get('ids') and results['ids'][0]:
+                similar = []
+                similar_tags = set()
+                for doc_id in results['ids'][0]:
+                    mem = self.memories.get(doc_id)
+                    if mem:
+                        similar.append(f"{mem.name} (path: {mem.path})")
+                        similar_tags.update(mem.tags)
+                if similar:
+                    lines.append(f"Similar memories: {', '.join(similar)}")
+                if similar_tags:
+                    lines.append(f"Their tags: {', '.join(sorted(similar_tags)[:15])}")
+        except Exception:
+            pass
+
+        # 2. Directory structure
+        if include_tree:
+            lines.append(f"Full memory tree:\n{self.tree()}")
+        else:
+            all_paths = sorted(set(m.path for m in self.memories.values() if m.path))
+            if all_paths:
+                tree_paths = sorted(set(
+                    "/".join(p.split("/")[:2]) for p in all_paths
+                ))
+                lines.append(f"Existing directory tree: {', '.join(tree_paths)}")
+
+        return "\n            ".join(lines)
 
     def analyze_content(self, content: str) -> Dict:
         """Analyze content using LLM to extract semantic metadata.
@@ -334,18 +486,37 @@ class AgenticMemorySystem:
                 }
             }
 
+        context_section = ""
+        if self.context_aware_analysis:
+            existing = self._get_existing_context(content, include_tree=self.context_aware_tree)
+            if existing:
+                context_section = f"""
+            IMPORTANT - Existing knowledge base context:
+            {existing}
+            Reuse existing paths and tags when the content fits. Only create new ones
+            if no existing option is appropriate. Keep naming consistent."""
+
         prompt = f"""Generate a structured analysis of the following content by:
             1. Creating a short, descriptive name (2-5 words, lowercase, like a file name)
-            2. Identifying the most salient keywords (focus on nouns, verbs, and key concepts)
-            3. Extracting core themes and contextual elements
-            4. Creating relevant categorical tags
+            2. Creating a directory path that categorizes this content in a knowledge tree
+            3. Identifying the most salient keywords (focus on nouns, verbs, and key concepts)
+            4. Extracting core themes and contextual elements
+            5. Creating relevant categorical tags
             {summary_instruction}
+            {context_section}
 
             Format the response as a JSON object:
             {{
                 "name":
                     // a short descriptive name for this memory (2-5 words, lowercase)
                     // e.g. "docker container basics", "postgresql jsonb indexing"
+                ,
+                "path":
+                    // a directory path (2-4 levels, lowercase) that places this memory
+                    // in a logical knowledge tree. Use broad domain first, then narrow topic.
+                    // e.g. "devops/containerization", "backend/database",
+                    //      "backend/middleware/auth", "ml/nlp", "devops/ci-cd"
+                    // Keep segments short (1-2 words each), consistent, and reusable.
                 ,
                 "keywords": [
                     // several specific, distinct keywords that capture key concepts and terminology
@@ -371,6 +542,9 @@ class AgenticMemorySystem:
 
         schema_properties = {
             "name": {
+                "type": "string",
+            },
+            "path": {
                 "type": "string",
             },
             "keywords": {
@@ -420,6 +594,8 @@ class AgenticMemorySystem:
             # Only update attributes that are not provided or have default values
             if note.name is None:
                 note.name = analysis.get("name")
+            if note.path is None:
+                note.path = analysis.get("path")
             if not note.keywords:
                 note.keywords = analysis.get("keywords", [])
             if note.context == "General":
@@ -429,9 +605,9 @@ class AgenticMemorySystem:
             if note.summary is None:
                 note.summary = analysis.get("summary")
         
-        # Update retriever with all documents
-        evo_label, note = self.process_memory(note)
+        # Add to memories before evolution so add_link can find it
         self.memories[note.id] = note
+        evo_label, note = self.process_memory(note)
         self._save_note(note)
 
         # Add to ChromaDB with complete metadata
@@ -462,7 +638,7 @@ class AgenticMemorySystem:
         # Reset ChromaDB collection
         self.retriever = ChromaRetriever(
             collection_name="memories", model_name=self.model_name,
-            persist_dir=self._chroma_dir
+            persist_dir=self._chroma_dir, embedding_backend=self.embedding_backend
         )
         
         # Re-add all memory documents with their complete metadata
@@ -557,29 +733,60 @@ class AgenticMemorySystem:
         return self.memories.get(memory_id)
     
     def update(self, memory_id: str, **kwargs) -> bool:
-        """Update a memory note. 
-        
+        """Update a memory note.
+
+        When content changes, all LLM-derived metadata (name, keywords, context,
+        tags, summary) is re-generated. The old markdown file is removed if the
+        filename changes.
+
         Args:
             memory_id: ID of memory to update
             **kwargs: Fields to update
-            
+
         Returns:
             bool: True if update successful
         """
         if memory_id not in self.memories:
             return False
-            
+
         note = self.memories[memory_id]
-        
+        old_filepath = note.filepath
+
         # Update fields
         for key, value in kwargs.items():
             if hasattr(note, key):
                 setattr(note, key, value)
-                
-        # Re-generate summary if content was updated and is long
-        if 'content' in kwargs and note.summary is not None:
+
+        # Re-analyze all metadata when content changes
+        if 'content' in kwargs:
             analysis = self.analyze_content(note.content)
-            note.summary = analysis.get("summary")
+            # Only overwrite fields that were NOT explicitly provided in kwargs
+            if 'name' not in kwargs:
+                note.name = analysis.get("name", note.name)
+            if 'path' not in kwargs:
+                note.path = analysis.get("path", note.path)
+            if 'keywords' not in kwargs:
+                note.keywords = analysis.get("keywords", note.keywords)
+            if 'context' not in kwargs:
+                note.context = analysis.get("context", note.context)
+            if 'tags' not in kwargs:
+                note.tags = analysis.get("tags", note.tags)
+            if 'summary' not in kwargs:
+                note.summary = analysis.get("summary")
+
+        # Delete old markdown file if filepath changed
+        if self._notes_dir and old_filepath != note.filepath:
+            old_full_path = os.path.join(self._notes_dir, old_filepath)
+            if os.path.exists(old_full_path):
+                os.remove(old_full_path)
+                # Clean up empty parent dirs
+                parent = os.path.dirname(old_full_path)
+                while parent != self._notes_dir:
+                    if os.path.isdir(parent) and not os.listdir(parent):
+                        os.rmdir(parent)
+                        parent = os.path.dirname(parent)
+                    else:
+                        break
 
         # Update in ChromaDB
         metadata = {
@@ -604,6 +811,30 @@ class AgenticMemorySystem:
 
         return True
     
+    def add_link(self, from_id: str, to_id: str):
+        """Create a forward link from one note to another. Backlink is auto-created."""
+        if from_id not in self.memories or to_id not in self.memories:
+            return
+        from_note = self.memories[from_id]
+        to_note = self.memories[to_id]
+        if to_id not in from_note.links:
+            from_note.links.append(to_id)
+            self._save_note(from_note)
+        if from_id not in to_note.backlinks:
+            to_note.backlinks.append(from_id)
+
+    def remove_link(self, from_id: str, to_id: str):
+        """Remove a forward link. Backlink is auto-removed."""
+        if from_id not in self.memories or to_id not in self.memories:
+            return
+        from_note = self.memories[from_id]
+        to_note = self.memories[to_id]
+        if to_id in from_note.links:
+            from_note.links.remove(to_id)
+            self._save_note(from_note)
+        if from_id in to_note.backlinks:
+            to_note.backlinks.remove(from_id)
+
     def delete(self, memory_id: str) -> bool:
         """Delete a memory note by its ID.
         
@@ -614,6 +845,14 @@ class AgenticMemorySystem:
             bool: True if memory was deleted, False if not found
         """
         if memory_id in self.memories:
+            note = self.memories[memory_id]
+
+            # Clean up all links/backlinks via interface
+            for linked_id in list(note.links):
+                self.remove_link(memory_id, linked_id)
+            for backlinked_id in list(note.backlinks):
+                self.remove_link(backlinked_id, memory_id)
+
             # Delete markdown file first (needs note for filename)
             self._delete_note_file(memory_id)
             # Delete from ChromaDB
@@ -895,7 +1134,10 @@ class AgenticMemorySystem:
                         if action == "strengthen":
                             suggest_connections = response_json["suggested_connections"]
                             new_tags = response_json["tags_to_update"]
-                            note.links.extend(suggest_connections)
+                            if self.max_links is not None:
+                                suggest_connections = suggest_connections[:self.max_links]
+                            for conn_id in suggest_connections:
+                                self.add_link(note.id, conn_id)
                             note.tags = new_tags
                         elif action == "update_neighbor":
                             new_context_neighborhood = response_json["new_context_neighborhood"]
